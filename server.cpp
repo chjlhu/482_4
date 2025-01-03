@@ -14,20 +14,16 @@ const std::string FS_READBLOCK = "FS_READBLOCK";
 const std::string FS_WRITEBLOCK = "FS_WRITEBLOCK";
 const std::string FS_CREATE = "FS_CREATE";
 const std::string FS_DELETE = "FS_DELETE";
-std::set<uint32_t> blockset;
 boost::shared_mutex mutex;
 
-uint32_t wrt = 1;
-void get_write()
+std::set<uint32_t> empty_blocks;
+int get_write()
 {
-    while (blockset.find(wrt) != blockset.end())
+    if (empty_blocks.empty())
     {
-        if (wrt == FS_DISKSIZE)
-        {
-            wrt = 1;
-        }
-        wrt++;
+        return -1;
     }
+    return *empty_blocks.begin();
 }
 
 void write_helper(const char *out)
@@ -37,6 +33,14 @@ void write_helper(const char *out)
     cout_lock.unlock();
 }
 
+enum DO
+{
+    READFILE,
+    WRITEFILE,
+    CREATEFILE,
+    DELETEFILE
+};
+
 class Request
 {
 private:
@@ -44,14 +48,10 @@ private:
     std::string username = "";
     std::string pathname = "";
     std::string etc = "";
-    std::string data = "";
-    std::string mssg = "";
+    char data[FS_BLOCKSIZE];
 
     void read(int at, void *ptr)
     {
-        std::stringstream ss;
-        ss << "Reading at block " << at;
-        write_helper(ss.str().c_str());
         boost::shared_lock<boost::shared_mutex> lock(mutex);
         disk_readblock(at, ptr);
     }
@@ -59,72 +59,10 @@ private:
     {
         boost::unique_lock<boost::shared_mutex> unique_lock(mutex);
         disk_writeblock(at, ptr);
-    }
-
-    void receive(int sock)
-    {
-        // receive message
-        int bytes_received = 0;
-        char buffer[BUFFER_SIZE];
-        bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0);
-        // command
-        int i = 0;
-        while (buffer[i] != ' ')
+        // remove block from set if not rewrite
+        if (empty_blocks.find(at) != empty_blocks.end())
         {
-            command += buffer[i];
-            mssg += buffer[i];
-            i++;
-        }
-        mssg += buffer[i];
-        i++;
-        // username
-        while (buffer[i] != ' ')
-        {
-            username += buffer[i];
-            mssg += buffer[i];
-            i++;
-        }
-        mssg += buffer[i];
-        i++;
-        // directory
-        //      delete
-        if (command == FS_DELETE)
-        {
-            while (buffer[i] != '\0')
-            {
-                Request::pathname += buffer[i];
-                Request::mssg += buffer[i];
-                i++;
-            }
-            Request::mssg += buffer[i];
-            return;
-        }
-        //      readblock, writeblock, create
-        while (buffer[i] != ' ')
-        {
-            Request::pathname += buffer[i];
-            Request::mssg += buffer[i];
-            i++;
-        }
-        Request::mssg += buffer[i];
-        i++;
-        // etc...
-        while (buffer[i] != '\0')
-        {
-            Request::etc += buffer[i];
-            Request::mssg += buffer[i];
-            i++;
-        }
-        Request::mssg += buffer[i];
-        // writeblock data
-        if (command == FS_WRITEBLOCK)
-        {
-            i++;
-            while (i < bytes_received)
-            {
-                data += buffer[i];
-                i++;
-            }
+            empty_blocks.erase(at);
         }
     }
 
@@ -161,7 +99,7 @@ private:
         int at = 0;
         std::string cur = "";
         fs_inode root;
-        while (i < root.size)
+        while (i < pathname.size())
         {
             if (pathname[i] == '/')
             {
@@ -191,6 +129,89 @@ private:
         return at;
     }
 
+public:
+    int receive(int sock)
+    {
+        // receive message
+        char buffer[BUFFER_SIZE];
+        auto buff_ptr = &buffer;
+        int bytes_received = 0;
+        int bytes = 0;
+        do
+        {
+            bytes = recv(sock, buff_ptr, BUFFER_SIZE - 1, 0);
+            buff_ptr += bytes;
+            bytes_received += bytes;
+        } while (bytes > 0);
+        // bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0);
+        // command
+        int i = 0;
+        while (buffer[i] != ' ')
+        {
+            command += buffer[i];
+            i++;
+        }
+        i++;
+        // username
+        while (buffer[i] != ' ')
+        {
+            username += buffer[i];
+            i++;
+        }
+        i++;
+        // directory
+        //      delete
+        if (command == FS_DELETE)
+        {
+            while (buffer[i] != '\0')
+            {
+                Request::pathname += buffer[i];
+                i++;
+            }
+            return DO::DELETEFILE;
+        }
+        //      readblock, writeblock, create
+        while (buffer[i] != ' ')
+        {
+            Request::pathname += buffer[i];
+            i++;
+        }
+        i++;
+        // etc...
+        while (buffer[i] != '\0')
+        {
+            Request::etc += buffer[i];
+            i++;
+        }
+        // writeblock data
+        if (command == FS_WRITEBLOCK)
+        {
+            i++;
+            int j = 0;
+            while (i < bytes_received)
+            {
+                data[j] = buffer[i];
+                i++;
+                j++;
+            }
+            if (j == FS_BLOCKSIZE)
+            {
+                j--;
+            }
+            data[j] = '\0';
+            return DO::WRITEFILE;
+        }
+        if (command == FS_READBLOCK)
+        {
+            return DO::READFILE;
+        }
+        if (command == FS_CREATE)
+        {
+            return DO::CREATEFILE;
+        }
+        return -1;
+    }
+
     int readfile()
     {
         int at = find_dirblock(true);
@@ -214,11 +235,7 @@ private:
         {
             return -1;
         }
-        char buffer[FS_BLOCKSIZE + 1];
-        read(file.blocks[block], (void *)&buffer);
-        // disk_readblock(file.blocks[block], (void *)&buffer);
-        buffer[FS_BLOCKSIZE] = '\0';
-        data = buffer;
+        read(file.blocks[block], (void *)&data);
         return 0;
     }
 
@@ -233,7 +250,6 @@ private:
         uint32_t block = atoi(etc.c_str());
         fs_inode file;
         read(at, (void *)&file);
-        // disk_readblock(at, (void *)&file);
         if (file.type != 'f')
         {
             return -1;
@@ -242,20 +258,28 @@ private:
         {
             return -1;
         }
+        if (block == FS_MAXFILEBLOCKS)
+        {
+            return -1;
+        }
 
         if (block < file.size)
         {
-            write(file.blocks[block], (void *)data.c_str());
-            // disk_writeblock(file.blocks[block], (void *)data.c_str());
+            write(file.blocks[block], (void *)&data);
             return 0;
         }
         if (block == file.size)
         {
-            get_write();
-            write(wrt, (void *)data.c_str());
-            // disk_writeblock(wrt, (void *)data.c_str());
-            blockset.insert(wrt);
-            return wrt;
+            int wrt = get_write();
+            if (wrt < 0)
+            {
+                return -1;
+            }
+            write(wrt, (void *)&data);
+            file.blocks[file.size] = wrt;
+            file.size = file.size + 1;
+            write(at, (void *)&file);
+            return 0;
         }
         return -1;
     }
@@ -278,7 +302,6 @@ private:
 
         fs_inode directory;
         read(at, (void *)&directory);
-        // disk_readblock(at, (void *)&directory);
         if (directory.type != 'd')
         {
             return -1;
@@ -305,19 +328,19 @@ private:
         strcpy(new_inode.owner, username.c_str());
         new_inode.size = 0;
         new_inode.type = etc[0];
-        get_write();
+        int wrt = get_write();
+        if (wrt < 0)
+        {
+            return -1;
+        }
         write(wrt, (void *)&new_inode);
-        // disk_writeblock(wrt, (void *)&new_inode);
         // 2) add fs_direntry to directory
-        fs_direntry new_direntry;
-        strcpy(new_direntry.name, filename.c_str());
-        new_direntry.inode_block = wrt;
         fs_direntry fileblock[FS_DIRENTRIES];
-        int block, pos = -1;
+        int block = -1;
+        int pos = -1;
         for (uint32_t i = 0; i < directory.size; i++)
         {
             read(directory.blocks[i], (void *)&fileblock);
-            // disk_readblock(directory.blocks[i], (void *)&fileblock);
             for (uint32_t j = 0; j < FS_DIRENTRIES; j++)
             {
                 if (strcmp(fileblock[j].name, filename.c_str()) == 0)
@@ -328,21 +351,29 @@ private:
                 {
                     block = i;
                     pos = j;
+                    i = directory.size;
+                    j = FS_DIRENTRIES;
                 }
             }
         }
         if (block < 0)
         {
+            if (directory.size == FS_MAXFILEBLOCKS)
+            {
+                return -1;
+            }
             fileblock[0].inode_block = wrt;
             strcpy(fileblock[0].name, filename.c_str());
             fileblock[1].inode_block = 0;
-            get_write();
+            int wrt = get_write();
+            if (wrt < 0)
+            {
+                return -1;
+            }
             write(wrt, (void *)&fileblock);
-            // disk_writeblock(wrt, (void *)&fileblock);
             directory.blocks[directory.size] = wrt;
-            directory.size += 1;
+            directory.size = directory.size + 1;
             write(at, (void *)&directory);
-            // disk_writeblock(at, (void *)&directory);
         }
         else
         {
@@ -353,8 +384,7 @@ private:
             {
                 fileblock[pos].inode_block = 0;
             }
-            write(directory.blocks[block], fileblock);
-            // disk_writeblock(directory.blocks[block], fileblock);
+            write(directory.blocks[block], (void *)&fileblock);
         }
         return 0;
     }
@@ -380,13 +410,11 @@ private:
         int inode, block, pos = -1;
         fs_inode root;
         read(at, (void *)&root);
-        // disk_readblock(at, (void *)&root);
 
         fs_direntry dirs[FS_DIRENTRIES];
         for (uint32_t i = 0; i < root.size; i++)
         {
-            read(at, (void *)&root);
-            // disk_readblock(root.blocks[i], (void *)&dirs);
+            read(root.blocks[i], (void *)&dirs);
             // 3) search each direntry
             for (uint32_t j = 0; j < FS_DIRENTRIES; j++)
             {
@@ -400,18 +428,19 @@ private:
                     inode = dirs[j].inode_block;
                     block = i;
                     pos = j;
+                    i = root.size;
+                    j = FS_DIRENTRIES;
                 }
             }
         }
         // 3) check directory to be deleted
         fs_inode leaf;
         read(inode, (void *)&leaf);
-        // disk_readblock(inode, (void *)&leaf);
         if (strcmp(leaf.owner, username.c_str()))
         {
             return -1;
         }
-        if (leaf.size > 0)
+        if (leaf.type == 'd' && leaf.size > 0)
         {
             return -1;
         }
@@ -421,7 +450,6 @@ private:
             // load last block
             fs_direntry last[FS_DIRENTRIES];
             read(root.blocks[root.size - 1], (void *)&last);
-            // disk_readblock(root.blocks[root.size - 1], (void *)&last);
             // find last value
             uint32_t end = 0;
             for (uint32_t i = 0; i < FS_DIRENTRIES; i++)
@@ -429,26 +457,25 @@ private:
                 if (last[i].inode_block == 0)
                 {
                     end = i - 1;
+                    i = FS_DIRENTRIES;
                 }
             }
             strcpy(dirs[pos].name, last[end].name);
             dirs[pos].inode_block = last[end].inode_block;
             last[end].inode_block = 0;
             // remove inode
-            blockset.erase(inode);
+            empty_blocks.insert(inode);
             // rewrite current block
             write(root.blocks[block], (void *)&dirs);
-            // disk_writeblock(root.blocks[block], (void *)&dirs);
             // rewrite last block
             if (end == 0)
             {
                 root.size -= 1;
+                empty_blocks.insert(root.blocks[root.size]);
                 write(at, (void *)&root);
-                // disk_writeblock(at, (void *)&root);
                 return 0;
             }
             write(root.blocks[root.size - 1], (void *)&last);
-            // disk_writeblock(root.blocks[root.size - 1], (void *)&last);
         }
         else
         {
@@ -458,15 +485,16 @@ private:
                 if (dirs[i].inode_block == 0)
                 {
                     end = i - 1;
+                    i = FS_DIRENTRIES;
                 }
             }
             // remove inode
-            blockset.erase(inode);
+            empty_blocks.insert(inode);
             if (end == 0)
             {
                 root.size -= 1;
+                empty_blocks.insert(root.blocks[root.size]);
                 write(at, (void *)&root);
-                // disk_writeblock(at, (void *)&root);
                 return 0;
             }
             strcpy(dirs[pos].name, dirs[end].name);
@@ -474,352 +502,70 @@ private:
             dirs[end].inode_block = 0;
             // rewrite current block
             write(root.blocks[block], (void *)&dirs);
-            // disk_writeblock(root.blocks[block], (void *)&dirs);
         }
         return 0;
     }
 
-public:
-    void run(int sock)
-    { // called after accepting connection
-        // 1) get whole message & parse command
-        receive(sock);
+    void get_message(std::string &mssg, bool e, bool d)
+    {
         mssg = command + " " + username + " " + pathname;
-        // 2) check values
-        if (username.size() > FS_MAXUSERNAME)
+        if (e)
         {
-            close(sock);
-            return;
+            mssg = mssg + " " + etc;
         }
-        // 3) call handlers
-        int status = -1;
-        if (command == FS_READBLOCK)
+        if (d)
         {
-            status = readfile();
-            mssg = mssg + " " + etc + '\0' + data;
+            mssg = mssg + '\0' + data;
         }
-        else if (command == FS_WRITEBLOCK)
-        {
-            status = writefile();
-            mssg = mssg + " " + etc + '\0';
-        }
-        else if (command == FS_CREATE)
-        {
-            status = create();
-            mssg = mssg + " " + etc + '\0';
-        }
-        else if (command == FS_DELETE)
-        {
-            status = del();
-            mssg += '\0';
-        }
-        if (status)
-        {
-            close(sock);
-            return;
-        }
-        // 3) send return message
-        printf("Returning with: %s\n", mssg.c_str());
-        send(sock, mssg.c_str(), mssg.size(), 0);
-        close(sock);
+        mssg = mssg + '\0';
     }
 };
 
 void handle(int sock)
 {
-    Request new_request;
-    new_request.run(sock);
+    Request request;
+
+    int status = -1;
+    std::string mssg = "";
+    switch (request.receive(sock))
+    {
+    case DO::READFILE:
+        status = request.readfile();
+        request.get_message(mssg, true, true);
+        break;
+    case DO::WRITEFILE:
+        status = request.writefile();
+        request.get_message(mssg, true, false);
+        break;
+    case DO::CREATEFILE:
+        status = request.create();
+        request.get_message(mssg, true, false);
+        break;
+    case DO::DELETEFILE:
+        status = request.del();
+        request.get_message(mssg, false, false);
+        break;
+    }
+
+    if (status == 0)
+    { // if (no errors), then send reply
+        send(sock, mssg.c_str(), mssg.size(), 0);
+    }
+    close(sock);
 }
-/*
-int read_check(int at, fs_inode &root, const char *owner, uint32_t b)
-{
-    // root is not file
-    if (root.type != 'f')
-    {
-        return -1;
-    }
-    // owner != owner of file
-    if (at > 0 && strcmp(root.owner, owner) != 0)
-    {
-        return -1;
-    }
-    // block > number of blocks in file
-    if (b >= root.size)
-    {
-        return -1;
-    }
-    return 0;
-}
-
-int read(int at, uint32_t b, const char *owner, char data[])
-{
-    fs_inode file;
-    // TODO: get file mutex
-    disk_readblock(at, (void *)&file);
-    //      file error checking
-    if (read_check(at, file, owner, b) < 0)
-    {
-        return -1;
-    }
-    // readblock -- socket, block to read from
-    disk_readblock(at, (void *)&data);
-    // TODO: release file mutex
-    return 0;
-}
-
-int write_check(fs_inode &root, const char *owner, uint32_t b)
-{
-    // dir does not lead to file
-    if (root.type != 'f')
-    {
-        return -1;
-    }
-    // owner != owner of file
-    if (strcmp(root.owner, owner) != 0)
-    {
-        return -1;
-    }
-    // block > number of blocks in file + 1
-    if (b > root.size)
-    {
-        return -1;
-    }
-    return 0;
-}
-
-int create_check(int at, fs_inode &root, const char *owner, char t)
-{
-    printf("In create_check!\n");
-    // owner != owner of file
-    if (at > 0 && strcmp(root.owner, owner) != 0)
-    {
-        printf("Error at owner, root (%s) & owner (%s)\n", root.owner, owner);
-        return -1;
-    }
-    // file is not directory
-    if (root.type != 'd')
-    {
-        printf("Error at root != directory\n");
-        return -1;
-    }
-    if (t != 'f' && t != 'd')
-    {
-        printf("Error at created type\n");
-        return -1;
-    }
-    return 0;
-}
-
-int create(fs_inode &root, const char *owner, const char *name, char t)
-{
-    // figure out where to add fs_direntry for new file/directory
-    fs_direntry block[FS_DIRENTRIES];
-    int at = -1;
-    int pos = root.size - 1;
-    printf("Create initialized with at %i and pos %i\n", at, pos);
-    bool addblock = false;
-    if (root.size > 0)
-    {
-        printf("Looking into root entries!\n");
-        disk_readblock(root.blocks[pos], (void *)&block);
-        for (uint32_t i = 0; i < FS_DIRENTRIES; i++)
-        {
-            if (block[i].inode_block == 0)
-            {
-                at = i;
-                i = FS_DIRENTRIES;
-            }
-        }
-        if (at < 0)
-        {
-            addblock = true;
-            pos++;
-        }
-        if (pos == FS_DIRENTRIES && addblock)
-        {
-            return -1;
-        }
-    }
-    else
-    {
-        printf("Empty directory!");
-        pos = 0;
-        at = 0;
-        addblock = true;
-    }
-    // write inode to disk
-    fs_inode file;
-    file.type = t;
-    strcpy(file.owner, owner);
-    file.size = 0;
-    //      get next writing block
-    get_write();
-    //      write to disk
-    disk_writeblock(wrt, (void *)&file);
-    blockset.insert(wrt);
-
-    // write block to disk
-    block[at].inode_block = wrt;
-    strcpy(block[at].name, name);
-    //      fix next direntry
-    if (static_cast<unsigned int>(at) < FS_DIRENTRIES - 1)
-    {
-        block[at + 1].inode_block = 0;
-    }
-    //      fix block added
-    if (addblock)
-    {
-        wrt++;
-        get_write();
-        root.blocks[pos] = wrt;
-        root.size += 1;
-    }
-    printf("Rewriting block direntry at %u, with name %s and inode %u\n", root.blocks[pos], block[at].name, block[at].inode_block);
-    disk_writeblock(root.blocks[pos], (void *)&block);
-    blockset.insert(wrt);
-    wrt++;
-
-    if (addblock)
-    {
-        printf("Returning addblock true!\n");
-        return 1;
-    }
-    printf("Returning addblock false!\n");
-    return 0;
-}
-
-int del_check(fs_inode &root, const char *owner)
-{
-    // file is not directory
-    if (root.type != 'd')
-    {
-        return -1;
-    }
-    // owner != owner of root
-    if (strcmp(root.owner, owner) != 0)
-    {
-        return -1;
-    }
-    // does not contain any files
-    if (root.size == 0)
-    {
-        return -1;
-    }
-    return 0;
-}
-
-int del(fs_inode root, const char *child)
-{
-    if (root.type == 'd' && root.size != 0)
-    {
-        return -1;
-    }
-    // remove child directory from blockset
-    int at, pos = -1;
-    fs_direntry block[FS_DIRENTRIES];
-    for (uint32_t i = 0; i < root.size; i++)
-    {
-        disk_readblock(root.blocks[i], block);
-        for (uint32_t j = 0; j < FS_DIRENTRIES; j++)
-        {
-            // looks for dir in owners
-            if (strcmp(block[j].name, child) == 0)
-            {
-                pos = j;
-                at = i;
-                j = FS_DIRENTRIES;
-                i = FS_MAXFILEBLOCKS;
-            }
-        }
-    }
-    if (pos < 0)
-    {
-        return -1;
-    }
-    // TODO: if directory, make sure it is empty
-    // TODO: if file, delete all children from blockset
-    blockset.erase(block[pos].inode_block);
-
-    // fix up directories
-    bool del_entry = false;
-    //      move last entry to replace deleted entry
-    if (at == static_cast<int>(root.size) - 1)
-    {
-        // shuffle within array
-        if (pos == 0)
-        {
-            del_entry = true;
-        }
-        else
-        {
-            int lst = -1;
-            for (uint32_t i = 0; i < FS_DIRENTRIES; i++)
-            {
-                if (block[i].inode_block == 0)
-                {
-                    lst = i - 1;
-                    i = FS_DIRENTRIES;
-                }
-            }
-            if (lst == -1)
-            {
-                lst = FS_DIRENTRIES - 1;
-            }
-            block[pos].inode_block = block[lst].inode_block;
-            strcpy(block[pos].name, block[lst].name);
-            block[lst].inode_block = 0;
-            disk_writeblock(root.blocks[at], (void *)&block);
-        }
-    }
-    else
-    {
-        // find last entry
-        fs_direntry last[FS_DIRENTRIES];
-        disk_readblock(root.blocks[root.size - 1], (void *)&last);
-        int lst = -1;
-        for (uint32_t i = 0; i < FS_DIRENTRIES; i++)
-        {
-            if (last[i].inode_block == 0)
-            {
-                lst = i - 1;
-                i = FS_DIRENTRIES;
-            }
-        }
-        if (lst < 0)
-        {
-            lst = FS_DIRENTRIES - 1;
-        }
-        if (lst == 0)
-        {
-            del_entry = true;
-        }
-        // set deleted entry to last entry & write to disk
-        block[pos].inode_block = last[lst].inode_block;
-        strcpy(block[pos].name, last[lst].name);
-        disk_writeblock(root.blocks[at], (void *)&block);
-        // set last entry to zero & write to disk
-        if (!del_entry)
-        {
-            last[lst].inode_block = 0;
-            disk_writeblock(root.blocks[root.size - 1], (void *)&last);
-        }
-    }
-    if (del_entry)
-    {
-        blockset.erase(root.blocks[root.size - 1]);
-        root.size -= 1;
-        return 1;
-    }
-    return 0;
-}
-*/
 
 int init_files()
 {
+    // init empty_blocks
+    for (uint32_t i = 0; i < FS_DISKSIZE; i++)
+    {
+        empty_blocks.insert(i);
+    }
+
+    // remove blocks from empty_blocks
     fs_inode root;
     fs_direntry block[FS_DIRENTRIES];
-    // add blocks to blockset
-    std::vector<int> list;
+    std::vector<uint32_t> list;
     list.push_back(0);
     size_t i = 0;
     while (i < list.size())
@@ -829,15 +575,16 @@ int init_files()
         {
             for (uint32_t j = 0; j < root.size; j++)
             {
-                blockset.insert(root.blocks[j]);
+                // remove file data block
+                empty_blocks.erase(root.blocks[j]);
             }
         }
         if (root.type == 'd')
         {
             for (uint32_t j = 0; j < root.size; j++)
             {
-                // add root.blocks[j] to blockset
-                blockset.insert(root.blocks[j]);
+                // remove direntry block
+                empty_blocks.erase(root.blocks[j]);
                 // read block
                 disk_readblock(root.blocks[j], (void *)&block);
                 for (uint32_t k = 0; k < FS_DIRENTRIES; k++)
@@ -855,7 +602,12 @@ int init_files()
         }
         i++;
     }
-    blockset.insert(list.begin(), list.end());
+    auto ptr = list.begin();
+    while (ptr != list.end())
+    {
+        empty_blocks.erase(*ptr);
+        ptr++;
+    }
     return 0;
 }
 
@@ -917,90 +669,6 @@ int search_direntry(uint32_t at, const char *dir)
     }
     return -1;
 }
-
-/*
-int find_dirblock(std::string &dir)
-{
-    int i = 1;
-    int at = -1;
-    std::string cur = "";
-    fs_inode root;
-    if (dir.size() == 0)
-    {
-        return 0;
-    }
-    printf("Find_dirblock read 1, reading block: 0\n");
-    disk_readblock(0, (void *)&root);
-    // at = directory home to end of dir
-    // cur = name of final directory/file
-    int size = dir.size();
-    while (i < size)
-    {
-        if (dir[i] == '/')
-        {
-            if (root.type == 'f')
-            {
-                return -1;
-            }
-            for (uint32_t j = 0; j < root.size; j++)
-            {
-                at = search_direntry(root.blocks[j], cur.c_str());
-                if (at >= 0)
-                {
-                    j = FS_MAXFILEBLOCKS;
-                }
-            }
-            if (at < 0)
-            {
-                return -1;
-            }
-            printf("Find_dirblock read 2, reading block: %i\n", at);
-            disk_readblock(at, (void *)&root);
-            cur = "";
-        }
-        else
-        {
-            cur += dir[i];
-        }
-        i++;
-    }
-    // at = directory/file at end of dir
-    if (at > 0)
-    {
-        printf("Find_dirblock read 3, reading block: %i\n", at);
-        disk_readblock(at, (void *)&root);
-    }
-    for (uint32_t j = 0; j < root.size; j++)
-    {
-        at = search_direntry(root.blocks[j], cur.c_str());
-        if (at >= 0)
-        {
-            j = FS_MAXFILEBLOCKS;
-        }
-    }
-    return at;
-}
-
-int read_helper(int bytes, int b, int d, char data[], char buffer[])
-{
-    printf("Calling read_helper at buffer byte %i and data byte %d\n", b, d);
-    while (b < bytes)
-    {
-        data[d] = buffer[b];
-        if (data[d] == '\0')
-        {
-            return d;
-        }
-        b++;
-        d++;
-        if (static_cast<unsigned int>(d) == FS_BLOCKSIZE - b)
-        {
-            b = bytes;
-        }
-    }
-    return d;
-}
-*/
 
 int main(int argc, char *argv[])
 {

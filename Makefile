@@ -25,7 +25,7 @@ export CPLUS_INCLUDE_PATH=/mnt/c/Users/tinaj/Downloads/EECS/482/chjlhu.4/boost:
 export LIBRARY_PATH=/mnt/c/Users/tinaj/Downloads/EECS/482/chjlhu.4/boost/lib:
 export LD_LIBRARY_PATH=/mnt/c/Users/tinaj/Downloads/EECS/482/chjlhu.4/boost/lib:
 
-all: fs test1
+all: fs test1 test2 test3 test4
 
 # Compile the file server and tag this compilation
 #
@@ -38,6 +38,12 @@ fs: ${FS_OBJS} ${LIBFSSERVER}
 # Compile a client program
 test1: test1.cpp ${LIBFSCLIENT}
 	${CC} -o $@ $^
+test2: test2.cpp ${LIBFSCLIENT}
+	${CC} -o $@ $^
+test3: test3.cpp ${LIBFSCLIENT}
+	${CC} -o $@ $^
+test4: test4.cpp ${LIBFSCLIENT}
+	${CC} -o $@ $^
 
 # Generic rules for compiling a source file to an object file
 %.o: %.cpp
@@ -46,4 +52,4 @@ test1: test1.cpp ${LIBFSCLIENT}
 	${CC} -c $<
 
 clean:
-	rm -f ${FS_OBJS} fs test1
+	rm -f ${FS_OBJS} fs test1 test2 test3 test4
